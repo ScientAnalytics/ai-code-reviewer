@@ -48,11 +48,11 @@ const rest_1 = __nccwpck_require__(5375);
 const openai_1 = __nccwpck_require__(47);
 const parse_diff_1 = __importDefault(__nccwpck_require__(4833));
 const minimatch_1 = __importDefault(__nccwpck_require__(2002));
-const GITHUB_TOKEN = core.getInput('GITHUB_TOKEN');
-const AZURE_OPENAI_ENDPOINT = core.getInput('AZURE_OPENAI_ENDPOINT');
-const AZURE_OPENAI_API_KEY = core.getInput('AZURE_OPENAI_API_KEY');
-const AZURE_OPENAI_API_VERSION = core.getInput('AZURE_OPENAI_API_VERSION');
-const AZURE_OPENAI_DEPLOYMENT = core.getInput('AZURE_OPENAI_DEPLOYMENT');
+const GITHUB_TOKEN = core.getInput("GITHUB_TOKEN");
+const AZURE_OPENAI_ENDPOINT = core.getInput("AZURE_OPENAI_ENDPOINT");
+const AZURE_OPENAI_API_KEY = core.getInput("AZURE_OPENAI_API_KEY");
+const AZURE_OPENAI_API_VERSION = core.getInput("AZURE_OPENAI_API_VERSION");
+const AZURE_OPENAI_DEPLOYMENT = core.getInput("AZURE_OPENAI_DEPLOYMENT");
 const octokit = new rest_1.Octokit({ auth: GITHUB_TOKEN });
 const client = new openai_1.AzureOpenAI({
     endpoint: AZURE_OPENAI_ENDPOINT,
@@ -63,7 +63,7 @@ const client = new openai_1.AzureOpenAI({
 function getPRDetails() {
     var _a, _b;
     return __awaiter(this, void 0, void 0, function* () {
-        const { repository, number } = JSON.parse((0, fs_1.readFileSync)(process.env.GITHUB_EVENT_PATH || '', 'utf8'));
+        const { repository, number } = JSON.parse((0, fs_1.readFileSync)(process.env.GITHUB_EVENT_PATH || "", "utf8"));
         const prResponse = yield octokit.pulls.get({
             owner: repository.owner.login,
             repo: repository.name,
@@ -73,8 +73,9 @@ function getPRDetails() {
             owner: repository.owner.login,
             repo: repository.name,
             pull_number: number,
-            title: (_a = prResponse.data.title) !== null && _a !== void 0 ? _a : '',
-            description: (_b = prResponse.data.body) !== null && _b !== void 0 ? _b : '',
+            title: (_a = prResponse.data.title) !== null && _a !== void 0 ? _a : "",
+            description: (_b = prResponse.data.body) !== null && _b !== void 0 ? _b : "",
+            headSha: prResponse.data.head.sha,
         };
     });
 }
@@ -84,20 +85,46 @@ function getDiff(owner, repo, pull_number) {
             owner,
             repo,
             pull_number,
-            mediaType: { format: 'diff' },
+            mediaType: { format: "diff" },
         });
         // @ts-expect-error - response.data is a string
         return response.data;
     });
 }
+function getFullFileContent(owner, repo, path, ref) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const response = yield octokit.repos.getContent({
+            owner,
+            repo,
+            path,
+            ref,
+        });
+        if (!("content" in response.data))
+            throw new Error(`Missing content for ${path}`);
+        const encoded = response.data.content;
+        return Buffer.from(encoded, "base64").toString("utf8");
+    });
+}
 function analyzeCode(parsedDiff, prDetails) {
     return __awaiter(this, void 0, void 0, function* () {
         const comments = [];
+        const fileCache = {};
         for (const file of parsedDiff) {
-            if (file.to === '/dev/null')
-                continue; // Ignore deleted files
+            if (file.to === "/dev/null")
+                continue;
+            if (!file.to)
+                continue;
+            if (!fileCache[file.to]) {
+                try {
+                    fileCache[file.to] = yield getFullFileContent(prDetails.owner, prDetails.repo, file.to, prDetails.headSha);
+                }
+                catch (e) {
+                    console.warn(`Unable to fetch full file content for ${file.to}: ${e}`);
+                    fileCache[file.to] = "";
+                }
+            }
             for (const chunk of file.chunks) {
-                const prompt = createPrompt(file, chunk, prDetails);
+                const prompt = createPrompt(file, chunk, prDetails, fileCache[file.to]);
                 const aiResponse = yield getAIResponse(prompt);
                 if (aiResponse) {
                     const newComments = createComment(file, chunk, aiResponse);
@@ -110,7 +137,7 @@ function analyzeCode(parsedDiff, prDetails) {
         return comments;
     });
 }
-function createPrompt(file, chunk, prDetails) {
+function createPrompt(file, chunk, prDetails, fullFile) {
     return `Your task is to review pull requests. Instructions:
 - Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
 - Do not give positive comments or compliments.
@@ -119,23 +146,36 @@ function createPrompt(file, chunk, prDetails) {
 - Use the given description only for the overall context and only comment the code.
 - IMPORTANT: NEVER suggest adding comments to the code.
 
-Review the following code diff in the file "${file.to}" and take the pull request title and description into account when writing the response.
-  
+You are reviewing changes in file: ${file.to}
+
 Pull request title: ${prDetails.title}
 Pull request description:
-
 ---
 ${prDetails.description}
 ---
 
-Git diff to review:
+Here is the full content of the file after the changes:
+\`\`\`ts
+${fullFile}
+\`\`\`
 
+And here is the diff to focus on:
 \`\`\`diff
 ${chunk.content}
 ${chunk.changes
-        // @ts-expect-error - ln and ln2 exists where needed
-        .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-        .join('\n')}
+        .map((c) => {
+        if ("ln" in c && c.ln !== undefined) {
+            return `${c.ln} ${c.content}`;
+        }
+        else if ("ln2" in c && c.ln2 !== undefined) {
+            return `${c.ln2} ${c.content}`;
+        }
+        else {
+            return c.content;
+        }
+    })
+        .join("\n")}
+
 \`\`\`
 `;
 }
@@ -144,29 +184,23 @@ function getAIResponse(prompt) {
     return __awaiter(this, void 0, void 0, function* () {
         try {
             const response = yield client.chat.completions.create({
-                model: '',
-                response_format: { type: 'json_object' },
-                messages: [
-                    {
-                        role: 'system',
-                        content: prompt,
-                    },
-                ],
+                model: "",
+                response_format: { type: "json_object" },
+                messages: [{ role: "system", content: prompt }],
             });
-            const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim()) || '{}';
+            const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim()) || "{}";
             return JSON.parse(res).reviews;
         }
         catch (error) {
-            console.error('Error:', error);
+            console.error("AI error:", error);
             return null;
         }
     });
 }
 function createComment(file, chunk, aiResponses) {
     return aiResponses.flatMap((aiResponse) => {
-        if (!file.to) {
+        if (!file.to)
             return [];
-        }
         return {
             body: aiResponse.reviewComment,
             path: file.to,
@@ -181,7 +215,7 @@ function createReviewComment(owner, repo, pull_number, comments) {
             repo,
             pull_number,
             comments,
-            event: 'COMMENT',
+            event: "COMMENT",
         });
     });
 }
@@ -189,41 +223,35 @@ function main() {
     var _a;
     return __awaiter(this, void 0, void 0, function* () {
         const prDetails = yield getPRDetails();
+        const eventData = JSON.parse((0, fs_1.readFileSync)((_a = process.env.GITHUB_EVENT_PATH) !== null && _a !== void 0 ? _a : "", "utf8"));
         let diff;
-        const eventData = JSON.parse((0, fs_1.readFileSync)((_a = process.env.GITHUB_EVENT_PATH) !== null && _a !== void 0 ? _a : '', 'utf8'));
-        if (eventData.action === 'opened') {
+        if (eventData.action === "opened") {
             diff = yield getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
         }
-        else if (eventData.action === 'synchronize') {
-            const newBaseSha = eventData.before;
-            const newHeadSha = eventData.after;
+        else if (eventData.action === "synchronize") {
             const response = yield octokit.repos.compareCommits({
-                headers: {
-                    accept: 'application/vnd.github.v3.diff',
-                },
+                headers: { accept: "application/vnd.github.v3.diff" },
                 owner: prDetails.owner,
                 repo: prDetails.repo,
-                base: newBaseSha,
-                head: newHeadSha,
+                base: eventData.before,
+                head: eventData.after,
             });
             diff = String(response.data);
         }
         else {
-            console.log('Unsupported event:', process.env.GITHUB_EVENT_NAME);
+            console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
             return;
         }
         if (!diff) {
-            console.log('No diff found');
+            console.log("No diff found");
             return;
         }
         const parsedDiff = (0, parse_diff_1.default)(diff);
         const excludePatterns = core
-            .getInput('exclude')
-            .split(',')
+            .getInput("exclude")
+            .split(",")
             .map((s) => s.trim());
-        const filteredDiff = parsedDiff.filter((file) => {
-            return !excludePatterns.some((pattern) => { var _a; return (0, minimatch_1.default)((_a = file.to) !== null && _a !== void 0 ? _a : '', pattern); });
-        });
+        const filteredDiff = parsedDiff.filter((file) => !excludePatterns.some((pattern) => { var _a; return (0, minimatch_1.default)((_a = file.to) !== null && _a !== void 0 ? _a : "", pattern); }));
         const comments = yield analyzeCode(filteredDiff, prDetails);
         if (comments.length > 0) {
             yield createReviewComment(prDetails.owner, prDetails.repo, prDetails.pull_number, comments);
@@ -231,7 +259,7 @@ function main() {
     });
 }
 main().catch((error) => {
-    console.error('Error:', error);
+    console.error("Unhandled error:", error);
     process.exit(1);
 });
 

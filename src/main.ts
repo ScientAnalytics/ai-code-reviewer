@@ -1,15 +1,19 @@
-import { readFileSync } from 'fs';
-import * as core from '@actions/core';
-import { Octokit } from '@octokit/rest';
-import { AzureOpenAI } from 'openai';
-import parseDiff, { Chunk, File } from 'parse-diff';
-import minimatch from 'minimatch';
+import { readFileSync } from "fs";
+import * as core from "@actions/core";
+import { Octokit } from "@octokit/rest";
+import { AzureOpenAI } from "openai";
+import parseDiff, { Chunk, File } from "parse-diff";
+import minimatch from "minimatch";
 
-const GITHUB_TOKEN: string = core.getInput('GITHUB_TOKEN');
-const AZURE_OPENAI_ENDPOINT: string = core.getInput('AZURE_OPENAI_ENDPOINT');
-const AZURE_OPENAI_API_KEY: string = core.getInput('AZURE_OPENAI_API_KEY');
-const AZURE_OPENAI_API_VERSION: string = core.getInput('AZURE_OPENAI_API_VERSION');
-const AZURE_OPENAI_DEPLOYMENT: string = core.getInput('AZURE_OPENAI_DEPLOYMENT');
+const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
+const AZURE_OPENAI_ENDPOINT: string = core.getInput("AZURE_OPENAI_ENDPOINT");
+const AZURE_OPENAI_API_KEY: string = core.getInput("AZURE_OPENAI_API_KEY");
+const AZURE_OPENAI_API_VERSION: string = core.getInput(
+  "AZURE_OPENAI_API_VERSION"
+);
+const AZURE_OPENAI_DEPLOYMENT: string = core.getInput(
+  "AZURE_OPENAI_DEPLOYMENT"
+);
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
@@ -26,11 +30,12 @@ interface PRDetails {
   pull_number: number;
   title: string;
   description: string;
+  headSha: string;
 }
 
 async function getPRDetails(): Promise<PRDetails> {
   const { repository, number } = JSON.parse(
-    readFileSync(process.env.GITHUB_EVENT_PATH || '', 'utf8')
+    readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8")
   );
   const prResponse = await octokit.pulls.get({
     owner: repository.owner.login,
@@ -41,8 +46,9 @@ async function getPRDetails(): Promise<PRDetails> {
     owner: repository.owner.login,
     repo: repository.name,
     pull_number: number,
-    title: prResponse.data.title ?? '',
-    description: prResponse.data.body ?? '',
+    title: prResponse.data.title ?? "",
+    description: prResponse.data.body ?? "",
+    headSha: prResponse.data.head.sha,
   };
 }
 
@@ -55,10 +61,30 @@ async function getDiff(
     owner,
     repo,
     pull_number,
-    mediaType: { format: 'diff' },
+    mediaType: { format: "diff" },
   });
   // @ts-expect-error - response.data is a string
   return response.data;
+}
+
+async function getFullFileContent(
+  owner: string,
+  repo: string,
+  path: string,
+  ref: string
+): Promise<string> {
+  const response = await octokit.repos.getContent({
+    owner,
+    repo,
+    path,
+    ref,
+  });
+
+  if (!("content" in response.data))
+    throw new Error(`Missing content for ${path}`);
+
+  const encoded = response.data.content;
+  return Buffer.from(encoded, "base64").toString("utf8");
 }
 
 async function analyzeCode(
@@ -66,11 +92,29 @@ async function analyzeCode(
   prDetails: PRDetails
 ): Promise<Array<{ body: string; path: string; line: number }>> {
   const comments: Array<{ body: string; path: string; line: number }> = [];
+  const fileCache: Record<string, string> = {};
 
   for (const file of parsedDiff) {
-    if (file.to === '/dev/null') continue; // Ignore deleted files
+    if (file.to === "/dev/null") continue;
+
+    if (!file.to) continue;
+
+    if (!fileCache[file.to]) {
+      try {
+        fileCache[file.to] = await getFullFileContent(
+          prDetails.owner,
+          prDetails.repo,
+          file.to,
+          prDetails.headSha
+        );
+      } catch (e) {
+        console.warn(`Unable to fetch full file content for ${file.to}: ${e}`);
+        fileCache[file.to] = "";
+      }
+    }
+
     for (const chunk of file.chunks) {
-      const prompt = createPrompt(file, chunk, prDetails);
+      const prompt = createPrompt(file, chunk, prDetails, fileCache[file.to]);
       const aiResponse = await getAIResponse(prompt);
       if (aiResponse) {
         const newComments = createComment(file, chunk, aiResponse);
@@ -80,10 +124,16 @@ async function analyzeCode(
       }
     }
   }
+
   return comments;
 }
 
-function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
+function createPrompt(
+  file: File,
+  chunk: Chunk,
+  prDetails: PRDetails,
+  fullFile: string
+): string {
   return `Your task is to review pull requests. Instructions:
 - Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
 - Do not give positive comments or compliments.
@@ -92,49 +142,52 @@ function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
 - Use the given description only for the overall context and only comment the code.
 - IMPORTANT: NEVER suggest adding comments to the code.
 
-Review the following code diff in the file "${
-    file.to
-  }" and take the pull request title and description into account when writing the response.
-  
+You are reviewing changes in file: ${file.to}
+
 Pull request title: ${prDetails.title}
 Pull request description:
-
 ---
 ${prDetails.description}
 ---
 
-Git diff to review:
+Here is the full content of the file after the changes:
+\`\`\`ts
+${fullFile}
+\`\`\`
 
+And here is the diff to focus on:
 \`\`\`diff
 ${chunk.content}
 ${chunk.changes
-  // @ts-expect-error - ln and ln2 exists where needed
-  .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-  .join('\n')}
+      .map((c: import("parse-diff").Change) => {
+        if ("ln" in c && c.ln !== undefined) {
+          return `${c.ln} ${c.content}`;
+        } else if ("ln2" in c && c.ln2 !== undefined) {
+          return `${c.ln2} ${c.content}`;
+        } else {
+          return c.content;
+        }
+      })
+      .join("\n")}
+
 \`\`\`
 `;
 }
 
-async function getAIResponse(prompt: string): Promise<Array<{
-  lineNumber: string;
-  reviewComment: string;
-}> | null> {
+async function getAIResponse(
+  prompt: string
+): Promise<Array<{ lineNumber: string; reviewComment: string }> | null> {
   try {
     const response = await client.chat.completions.create({
-      model: '',
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content: prompt,
-        },
-      ],
+      model: "", // fill this with your deployed model name
+      response_format: { type: "json_object" },
+      messages: [{ role: "system", content: prompt }],
     });
 
-    const res = response.choices[0].message?.content?.trim() || '{}';
+    const res = response.choices[0].message?.content?.trim() || "{}";
     return JSON.parse(res).reviews;
   } catch (error) {
-    console.error('Error:', error);
+    console.error("AI error:", error);
     return null;
   }
 }
@@ -142,15 +195,10 @@ async function getAIResponse(prompt: string): Promise<Array<{
 function createComment(
   file: File,
   chunk: Chunk,
-  aiResponses: Array<{
-    lineNumber: string;
-    reviewComment: string;
-  }>
+  aiResponses: Array<{ lineNumber: string; reviewComment: string }>
 ): Array<{ body: string; path: string; line: number }> {
   return aiResponses.flatMap((aiResponse) => {
-    if (!file.to) {
-      return [];
-    }
+    if (!file.to) return [];
     return {
       body: aiResponse.reviewComment,
       path: file.to,
@@ -170,60 +218,51 @@ async function createReviewComment(
     repo,
     pull_number,
     comments,
-    event: 'COMMENT',
+    event: "COMMENT",
   });
 }
 
 async function main() {
   const prDetails = await getPRDetails();
-  let diff: string | null;
   const eventData = JSON.parse(
-    readFileSync(process.env.GITHUB_EVENT_PATH ?? '', 'utf8')
+    readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
   );
 
-  if (eventData.action === 'opened') {
+  let diff: string | null;
+  if (eventData.action === "opened") {
     diff = await getDiff(
       prDetails.owner,
       prDetails.repo,
       prDetails.pull_number
     );
-  } else if (eventData.action === 'synchronize') {
-    const newBaseSha = eventData.before;
-    const newHeadSha = eventData.after;
-
+  } else if (eventData.action === "synchronize") {
     const response = await octokit.repos.compareCommits({
-      headers: {
-        accept: 'application/vnd.github.v3.diff',
-      },
+      headers: { accept: "application/vnd.github.v3.diff" },
       owner: prDetails.owner,
       repo: prDetails.repo,
-      base: newBaseSha,
-      head: newHeadSha,
+      base: eventData.before,
+      head: eventData.after,
     });
-
     diff = String(response.data);
   } else {
-    console.log('Unsupported event:', process.env.GITHUB_EVENT_NAME);
+    console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
     return;
   }
 
   if (!diff) {
-    console.log('No diff found');
+    console.log("No diff found");
     return;
   }
 
   const parsedDiff = parseDiff(diff);
-
   const excludePatterns = core
-    .getInput('exclude')
-    .split(',')
+    .getInput("exclude")
+    .split(",")
     .map((s) => s.trim());
-
-  const filteredDiff = parsedDiff.filter((file) => {
-    return !excludePatterns.some((pattern) =>
-      minimatch(file.to ?? '', pattern)
-    );
-  });
+  const filteredDiff = parsedDiff.filter(
+    (file) =>
+      !excludePatterns.some((pattern) => minimatch(file.to ?? "", pattern))
+  );
 
   const comments = await analyzeCode(filteredDiff, prDetails);
   if (comments.length > 0) {
@@ -237,6 +276,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error('Error:', error);
+  console.error("Unhandled error:", error);
   process.exit(1);
 });
